@@ -1,0 +1,17 @@
+#videos{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2em;
+}
+
+.video-player{
+    width: 100%;
+    height: 100%;
+    background-color: black;
+}
+
+#offer{
+    height: 10em;
+    margin: 2em 0;
+
+}
