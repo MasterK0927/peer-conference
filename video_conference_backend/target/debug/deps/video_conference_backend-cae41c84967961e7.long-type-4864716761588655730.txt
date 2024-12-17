@@ -1,1 +1,0 @@
-warp::Server<warp::filter::map::Map<warp::filter::and::And<Exact<warp::path::internal::Opaque<&str>>, impl warp::Filter + warp::filter::FilterBase<Extract = (Ws,), Error = Rejection> + std::marker::Copy>, {closure@src/main.rs:32:14: 32:32}>>
