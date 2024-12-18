@@ -1,7 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
 
-    // State management
     let localVideoElement;
     let remoteVideoElement;
     let peerConnection = null;
@@ -15,16 +14,16 @@
     let isOfferReceived = false;
     let isScreenSharing = false;
     let eventLogs = [];
+    let currentChallenge = null;
+    let keyPair = null;
     
-    // Device state tracking
     let deviceState = {
         isVideoMuted: false,
         isAudioMuted: false,
         isRecording: false
     };
 
-    // Configuration
-    const SIGNALING_SERVER = "wss://localhost:3030/ws";
+    const SIGNALING_SERVER = "ws://127.0.0.1:3030";
     const mediaConstraints = {
         video: { width: 1280, height: 720 },
         audio: true
@@ -50,6 +49,159 @@
         console.log(`[${type.toUpperCase()}] ${message}`);
     }
 
+    async function generateChallenge() {
+        const challenge = crypto.getRandomValues(new Uint8Array(32));
+        return Array.from(challenge);
+    }
+
+    async function generateKeyPair() {
+        try {
+            // Generate ECDSA key pair for signing
+            const signingKeyPair = await crypto.subtle.generateKey(
+                {
+                    name: 'ECDSA',
+                    namedCurve: 'P-256'
+                },
+                true,
+                ['sign', 'verify']
+            );
+
+            // Generate RSA key pair for encryption
+            const encryptionKeyPair = await crypto.subtle.generateKey(
+                {
+                    name: 'RSA-OAEP',
+                    modulusLength: 2048,
+                    publicExponent: new Uint8Array([1, 0, 1]),
+                    hash: 'SHA-256'
+                },
+                true,
+                ['encrypt', 'decrypt']
+            );
+
+            // Export the public keys in the correct format
+            const signingPublicKey = await crypto.subtle.exportKey(
+                'raw',  // Changed from 'spki' to 'raw' for ECDSA
+                signingKeyPair.publicKey
+            );
+
+            const encryptionPublicKey = await crypto.subtle.exportKey(
+                'spki',
+                encryptionKeyPair.publicKey
+            );
+
+            keyPair = {
+                signing: signingKeyPair,
+                encryption: encryptionKeyPair
+            };
+
+            log('Key pairs generated successfully', 'success');
+            log(`Signing public key length: ${signingPublicKey.byteLength}`, 'info');
+            log(`Encryption public key length: ${encryptionPublicKey.byteLength}`, 'info');
+
+            return {
+                signingPublicKey: Array.from(new Uint8Array(signingPublicKey)),
+                encryptionPublicKey: Array.from(new Uint8Array(encryptionPublicKey)),
+                keyPair: keyPair
+            };
+        } catch (error) {
+            log(`Key pair generation error: ${error.message}`, 'error');
+            console.error('Full key pair generation error:', error);
+            return null;
+        }
+    }
+
+    async function signPayload(payload) {
+        try {
+            if (!keyPair || !keyPair.signing) {
+                throw new Error('Signing key pair not initialized');
+            }
+
+            const encoder = new TextEncoder();
+            const verificationPayload = {
+                challenge: payload.challenge,
+                offer: payload.offer,
+                encrypted_data: payload.encrypted_data,
+                connection_message: payload.connection_message
+            };
+
+            const data = encoder.encode(JSON.stringify(verificationPayload));
+            
+            const signature = await crypto.subtle.sign(
+                {
+                    name: 'ECDSA',
+                    hash: { name: 'SHA-256' }
+                },
+                keyPair.signing.privateKey,
+                data
+            );
+
+            // Return the signature as a byte array
+            return Array.from(new Uint8Array(signature));
+        } catch (error) {
+            log(`Payload signing error: ${error.message}`, 'error');
+            console.error('Full signing error:', error);
+            return null;
+        }
+    }
+
+    async function verifyPayloadSignature(payload, signature, publicKey) {
+        try {
+            log('Starting payload signature verification', 'info');
+            
+            // Log input details
+            log(`Payload details: ${JSON.stringify({
+                challenge: payload.challenge ? Array.from(payload.challenge) : null,
+                offer: payload.offer ? 'Present' : 'Not Present',
+                encrypted_data: payload.encrypted_data ? 'Present' : 'Not Present',
+                connection_message: payload.connection_message
+            })}`, 'info');
+            
+            log(`Public key length: ${publicKey.length}`, 'info');
+            log(`Signature length: ${signature.length}`, 'info');
+
+            const importedPublicKey = await crypto.subtle.importKey(
+                'spki',
+                new Uint8Array(publicKey),
+                {
+                    name: 'ECDSA',
+                    namedCurve: 'P-256'
+                },
+                true,
+                ['verify']
+            );
+
+            const verificationPayload = {
+                challenge: payload.challenge,
+                offer: payload.offer,
+                encrypted_data: payload.encrypted_data,
+                connection_message: payload.connection_message
+            };
+
+            const encoder = new TextEncoder();
+            const data = encoder.encode(JSON.stringify(verificationPayload));
+
+            log(`Verification payload JSON: ${JSON.stringify(verificationPayload)}`, 'info');
+            log(`Verification data bytes length: ${data.length}`, 'info');
+
+            const verificationResult = await crypto.subtle.verify(
+                {
+                    name: 'ECDSA',
+                    hash: 'SHA-256'
+                },
+                importedPublicKey,
+                new Uint8Array(signature),
+                data
+            );
+
+            log(`Signature verification result: ${verificationResult}`, 'info');
+            return verificationResult;
+        } catch (error) {
+            log(`Signature verification error: ${error.message}`, 'error');
+            console.error('Full verification error:', error);
+            return false;
+        }
+    }
+
     async function initializeWebRTC() {
         try {
             localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
@@ -69,32 +221,208 @@
         }
     }
 
-    function connectSignalingServer() {
-        signalingSocket = new WebSocket(SIGNALING_SERVER);
+    
+    async function createOffer() {
+        try {
+            if (!keyPair) {
+                const keyGenResult = await generateKeyPair();
+                if (!keyGenResult) {
+                    throw new Error('Failed to generate key pair');
+                }
+                
+                // Log key pair generation details
+                log(`Key pair generated successfully`, 'success');
+                log(`Signing public key exported length: ${keyGenResult.signingPublicKey.length}`, 'info');
+            }
 
-        signalingSocket.onopen = () => {
-            log('Signaling server connected', 'success');
-            connectionStatus = 'Connected to Signaling Server';
-        };
+            const challenge = await generateChallenge();
+            currentChallenge = challenge;
+            log(`Generated challenge: ${Array.from(challenge)}`, 'info');
 
-        signalingSocket.onmessage = async (event) => {
-            const message = JSON.parse(event.data);
-            await handleSignalingMessage(message);
-        };
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            log(`Created local offer`, 'success');
 
-        signalingSocket.onerror = error => log(`Signaling error: ${error}`, 'error');
-        signalingSocket.onclose = () => {
-            log('Signaling server disconnected', 'warning');
-            connectionStatus = 'Disconnected';
-        };
+            const publicKey = await crypto.subtle.exportKey(
+                'spki', 
+                keyPair.encryption.publicKey
+            );
+
+            const connectionMessage = offerMessage || 'Secure connection request';
+
+            const encryptedData = await encryptWithPublicKey(
+                connectionMessage, 
+                new Uint8Array(publicKey)
+            );
+
+            if (!encryptedData) {
+                throw new Error('Encryption failed: Unable to encrypt connection message');
+            }
+
+            const signature = await signPayload({
+                challenge: Array.from(challenge),
+                offer: offer,
+                encrypted_data: encryptedData,
+                connection_message: connectionMessage
+            });
+
+            if (!signature) {
+                throw new Error('Failed to create payload signature');
+            }
+
+            log(`Signature created successfully`, 'success');
+
+            const connectionVerificationPayload = {
+                challenge: Array.from(challenge),
+                offer: offer,
+                encrypted_data: encryptedData,
+                connection_message: connectionMessage,
+                public_key: Array.from(new Uint8Array(publicKey)),
+                signature: signature
+            };
+
+            // Log the full payload before sending
+            log(`Connection verification payload details:
+                Challenge length: ${connectionVerificationPayload.challenge.length}
+                Public key length: ${connectionVerificationPayload.public_key.length}
+                Signature length: ${connectionVerificationPayload.signature.length}
+                Offer present: ${!!connectionVerificationPayload.offer}
+                Encrypted data present: ${!!connectionVerificationPayload.encrypted_data}
+            `, 'info');
+
+            sendSignalingMessage('offer-with-challenge', connectionVerificationPayload);
+            log('Offer sent with challenge and signature', 'success');
+        } catch (error) {
+            log(`Offer creation error: ${error.message}`, 'error');
+            console.error('Full offer creation error:', error);
+        }
     }
 
-    function sendSignalingMessage(type, payload) {
-        if (signalingSocket?.readyState === WebSocket.OPEN) {
-            signalingSocket.send(JSON.stringify({ 
-                signal_type: type, 
-                payload: JSON.stringify(payload)
-            }));
+    async function handleOfferWithChallenge(payload) {
+        try {
+            const { 
+                challenge, 
+                offer, 
+                connection_message, 
+                public_key, 
+                signature 
+            } = payload;
+            
+            const signatureVerified = await verifyPayloadSignature(
+                { challenge, offer, connection_message }, 
+                signature, 
+                public_key
+            );
+
+            if (!signatureVerified) {
+                log('Payload signature verification failed', 'error');
+                return;
+            }
+
+            const decryptedMessage = await decryptWithPublicKey(
+                connection_message, 
+                public_key
+            );
+
+            if (decryptedMessage) {
+                log('Connection message verified successfully', 'success');
+                isOfferReceived = true;
+                
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+
+                const responsePayload = {
+                    challenge: challenge,
+                    challenge_response: await encryptWithPublicKey(
+                        JSON.stringify(challenge), 
+                        public_key
+                    )
+                };
+
+                sendSignalingMessage('challenge-response', responsePayload);
+            }
+        } catch (error) {
+            log(`Offer with challenge error: ${error.message}`, 'error');
+        }
+    }
+
+    async function encryptWithPublicKey(message, publicKeyData) {
+        try {
+            // Ensure publicKeyData is a valid array or Uint8Array
+            const keyData = publicKeyData instanceof Uint8Array 
+                ? publicKeyData 
+                : new Uint8Array(publicKeyData);
+
+            // Validate key data
+            if (!keyData || keyData.length === 0) {
+                throw new Error('Invalid public key data');
+            }
+
+            // Generate a random IV (even though RSA-OAEP doesn't use it, we need it for the payload structure)
+            const iv = crypto.getRandomValues(new Uint8Array(16));
+
+            const publicKey = await crypto.subtle.importKey(
+                'spki',
+                keyData,
+                {
+                    name: 'RSA-OAEP',
+                    hash: 'SHA-256'
+                },
+                false,
+                ['encrypt']
+            );
+
+            const encoder = new TextEncoder();
+            const data = encoder.encode(message);
+
+            const encryptedData = await crypto.subtle.encrypt(
+                { name: 'RSA-OAEP' },
+                publicKey,
+                data
+            );
+
+            // Create signature for the encrypted data
+            const signature = crypto.getRandomValues(new Uint8Array(64)); // Placeholder signature
+            
+            return {
+                encrypted: Array.from(new Uint8Array(encryptedData)),
+                iv: Array.from(iv), // Include the IV in the payload
+                sender_ip: window.location.hostname, // Add sender IP
+                signature: Array.from(signature) // Include the signature
+            };
+        } catch (error) {
+            log(`Public key encryption error: ${error.message}`, 'error');
+            console.error('Full encryption error:', error);
+            return null;
+        }
+    }
+
+    async function decryptWithPublicKey(encryptedMessage, publicKeyData) {
+        try {
+            const publicKey = await crypto.subtle.importKey(
+                'spki',
+                new Uint8Array(publicKeyData),
+                {
+                    name: 'RSA-OAEP',
+                    hash: 'SHA-256'
+                },
+                false,
+                ['decrypt']
+            );
+
+            const decryptedData = await crypto.subtle.decrypt(
+                {
+                    name: 'RSA-OAEP'
+                },
+                publicKey,
+                new Uint8Array(encryptedMessage)
+            );
+
+            return new TextDecoder().decode(decryptedData);
+        } catch (error) {
+            log(`Public key decryption error: ${error.message}`, 'error');
+            return null;
         }
     }
 
@@ -102,9 +430,14 @@
         try {
             const parsedPayload = JSON.parse(message.payload);
             switch (message.signal_type) {
-                case 'offer': 
-                    isOfferReceived = true;
-                    await handleOffer(parsedPayload); 
+                case 'offer-with-challenge': 
+                    await handleOfferWithChallenge(parsedPayload); 
+                    break;
+                case 'challenge-response':
+                    await validateChallengeResponse(parsedPayload);
+                    break;
+                case 'connection-verified':
+                    handleConnectionVerification();
                     break;
                 case 'answer': 
                     await handleAnswer(parsedPayload); 
@@ -124,138 +457,112 @@
         }
     }
 
-    async function getPublicIP() {
+    function connectSignalingServer() {
         try {
-            const response = await fetch('https://api.ipify.org?format=json');
-            const data = await response.json();
-            return data.ip;
-        } catch (error) {
-            log('Failed to get public IP', 'error');
-            return null;
-        }
-    }
+            signalingSocket = new WebSocket(SIGNALING_SERVER);
 
-    async function generateKeyFromIP(ip) {
-        const encoder = new TextEncoder();
-        const data = encoder.encode(ip);
-        const hash = await crypto.subtle.digest('SHA-256', data);
-        return crypto.subtle.importKey(
-            'raw',
-            hash,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['encrypt', 'decrypt']
-        );
-    }
+            signalingSocket.onopen = () => {
+                connectionStatus = 'Connected';
+                log('Signaling server connection established', 'success');
+            };
 
-    async function encryptWithIP(message) {
-        const senderIP = await getPublicIP();
-        if (!senderIP) return null;
-
-        const key = await generateKeyFromIP(senderIP);
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const encoder = new TextEncoder();
-        const encodedMessage = encoder.encode(message);
-
-        const encryptedData = await crypto.subtle.encrypt(
-            {
-                name: 'AES-GCM',
-                iv: iv
-            },
-            key,
-            encodedMessage
-        );
-
-        return {
-            encrypted: Array.from(new Uint8Array(encryptedData)),
-            iv: Array.from(iv),
-            senderIP
-        };
-    }
-
-    async function decryptWithIP(encryptedData, iv, senderIP) {
-        try {
-            const key = await generateKeyFromIP(senderIP);
-            const decrypted = await crypto.subtle.decrypt(
-                {
-                    name: 'AES-GCM',
-                    iv: new Uint8Array(iv)
-                },
-                key,
-                new Uint8Array(encryptedData)
-            );
-
-            return new TextDecoder().decode(decrypted);
-        } catch (error) {
-            log('Decryption failed: Invalid IP signature', 'error');
-            return null;
-        }
-    }
-
-    async function createOffer() {
-        try {
-            const offer = await peerConnection.createOffer();
-            await peerConnection.setLocalDescription(offer);
-
-            const encryptedData = await encryptWithIP(
-                offerMessage || 'Secure connection request'
-            );
-
-            if (encryptedData) {
-                sendSignalingMessage('offer', {
-                    offer,
-                    encryptedData
-                });
-                log('Offer sent with IP-signed encrypted message', 'success');
-            } else {
-                throw new Error('Failed to encrypt offer message');
-            }
-        } catch (error) {
-            log(`Offer creation error: ${error.message}`, 'error');
-        }
-    }
-
-    async function handleOffer(data) {
-        try {
-            const { offer, encryptedData } = data;
-            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-
-            if (encryptedData) {
-                const decryptedMessage = await decryptWithIP(
-                    encryptedData.encrypted,
-                    encryptedData.iv,
-                    encryptedData.senderIP
-                );
-
-                if (decryptedMessage) {
-                    log(`Verified offer from IP ${encryptedData.senderIP}`, 'success');
-                    log(`Decrypted message: ${decryptedMessage}`, 'info');
-                } else {
-                    throw new Error('Failed to verify offer signature');
+            signalingSocket.onmessage = async (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    await handleSignalingMessage(message);
+                } catch (error) {
+                    log(`Signaling message error: ${error.message}`, 'error');
                 }
-            }
+            };
 
-            const answer = await peerConnection.createAnswer();
-            await peerConnection.setLocalDescription(answer);
-            sendSignalingMessage('answer', answer);
+            signalingSocket.onclose = () => {
+                connectionStatus = 'Disconnected';
+                log('Signaling server connection closed', 'warning');
+            };
+
+            signalingSocket.onerror = (error) => {
+                log(`Signaling server connection error: ${error}`, 'error');
+            };
         } catch (error) {
-            log(`Offer handling error: ${error.message}`, 'error');
-            rejectOffer();
+            log(`WebSocket connection error: ${error.message}`, 'error');
         }
     }
 
+    function sendSignalingMessage(signalType, payload) {
+        if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
+            const message = JSON.stringify({
+                signal_type: signalType,
+                payload: JSON.stringify(payload),
+                timestamp: Date.now()
+            });
+            signalingSocket.send(message);
+        } else {
+            log('Signaling socket not open', 'error');
+        }
+    }
+
+    async function validateChallengeResponse(challengePayload) {
+        try {
+            if (currentChallenge && 
+                JSON.stringify(challengePayload) === JSON.stringify(currentChallenge)) {
+                log('Challenge validated successfully', 'success');
+                
+                sendSignalingMessage('connection-verified', {});
+            } else {
+                log('Challenge validation failed', 'error');
+            }
+        } catch (error) {
+            log(`Challenge validation error: ${error.message}`, 'error');
+        }
+    }
+
+    function handleConnectionVerification() {
+        peerConnectionStatus = 'Verified';
+        log('Peer connection fully verified', 'success');
+    }
+
+    async function handleAnswer(answer) {
+        try {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+            log('Remote answer set successfully', 'success');
+        } catch (error) {
+            log(`Answer handling error: ${error.message}`, 'error');
+        }
+    }
+
+    function handleICECandidate(event) {
+        if (event.candidate) {
+            sendSignalingMessage('ice-candidate', event.candidate);
+            log('ICE candidate generated', 'info');
+        }
+    }
+
+    function handleRemoteTrack(event) {
+        if (event.streams && event.streams[0]) {
+            remoteVideoElement.srcObject = event.streams[0];
+            log('Remote track received', 'success');
+        }
+    }
+
+    function handleConnectionStateChange() {
+        if (peerConnection) {
+            peerConnectionStatus = peerConnection.connectionState;
+            log(`Connection state changed: ${peerConnectionStatus}`, 'info');
+        }
+    }
+    
     function sendChatMessage() {
-        if (!chatMessage.trim()) return;
-        
-        const messageObj = {
-            text: chatMessage,
-            sender: 'local',
-            timestamp: new Date().toLocaleTimeString()
-        };
-        
-        chatMessages = [...chatMessages, messageObj];
-        sendSignalingMessage('chat', messageObj);
-        chatMessage = '';
+        if (chatMessage.trim()) {
+            const message = {
+                text: chatMessage,
+                sender: 'Me',
+                timestamp: new Date().toLocaleTimeString()
+            };
+
+            sendSignalingMessage('chat', message);
+            chatMessages = [...chatMessages, message];
+            chatMessage = '';
+        }
     }
 
     function handleIncomingChat(message) {
@@ -321,26 +628,6 @@
         log(`${kind.charAt(0).toUpperCase() + kind.slice(1)} ${tracks[0].enabled ? 'Unmuted' : 'Muted'}`, 'info');
     }
 
-    function handleICECandidate(event) {
-        if (event.candidate) {
-            sendSignalingMessage('ice-candidate', event.candidate);
-        }
-    }
-
-    function handleRemoteTrack(event) {
-        if (event.streams[0]) {
-            remoteVideoElement.srcObject = event.streams[0];
-            log('Remote track received', 'success');
-        }
-    }
-
-    function handleConnectionStateChange() {
-        if (peerConnection) {
-            peerConnectionStatus = peerConnection.connectionState;
-            log(`Connection state: ${peerConnectionStatus}`, 'info');
-        }
-    }
-
     function handleOfferRejected() {
         log('Offer was rejected by peer', 'warning');
     }
@@ -351,14 +638,20 @@
         log('Offer rejected', 'warning');
     }
 
-    onMount(() => {
-        initializeWebRTC();
+    onMount(async () => {
+        await initializeWebRTC();
     });
 
     onDestroy(() => {
-        localStream?.getTracks().forEach(track => track.stop());
-        peerConnection?.close();
-        signalingSocket?.close();
+        if (peerConnection) {
+            peerConnection.close();
+        }
+        if (signalingSocket) {
+            signalingSocket.close();
+        }
+        if (localStream) {
+            localStream.getTracks().forEach(track => track.stop());
+        }
     });
 </script>
 
