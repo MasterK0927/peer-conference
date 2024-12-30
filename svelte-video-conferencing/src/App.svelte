@@ -1,641 +1,403 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
-
-    let localVideoElement;
+    import { slide } from 'svelte/transition';
+    import * as ed from '@noble/ed25519';
+    import { sha512 } from '@noble/hashes/sha512';
+    
+    ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
+    
+    const SignalTypes = {
+        SECURE_OFFER: 'secure-offer',
+        SECURE_ANSWER: 'secure-answer',
+        ICE_CANDIDATE: 'ice-candidate'
+    };
+    
+    let localVideoElement; 
     let remoteVideoElement;
     let peerConnection = null;
     let localStream = null;
     let signalingSocket = null;
     let connectionStatus = 'Not Connected';
     let peerConnectionStatus = 'Disconnected';
-    let chatMessage = '';
-    let chatMessages = [];
-    let offerMessage = '';
-    let isOfferReceived = false;
     let isScreenSharing = false;
     let eventLogs = [];
-    let currentChallenge = null;
+    let isInitialized = false;
+    
     let keyPair = null;
+    let clientId = null;
+    let isVerified = false;
+    
+    let isCalling = false;
+    let canCreateOffer = false;
     
     let deviceState = {
         isVideoMuted: false,
-        isAudioMuted: false,
-        isRecording: false
+        isAudioMuted: false
     };
-
+    
     const SIGNALING_SERVER = "ws://127.0.0.1:3030";
     const mediaConstraints = {
         video: { width: 1280, height: 720 },
         audio: true
     };
-    const iceServers = [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { 
-            urls: 'turn:your-turn-server.com', 
-            credential: 'your-turn-credential', 
-            username: 'your-turn-username' 
-        }
-    ];
-    const peerConfig = { 
-        iceServers, 
-        sdpSemantics: 'unified-plan', 
-        bundlePolicy: 'max-bundle' 
+    
+    const peerConfig = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+        ]
     };
-
+    
     function log(message, type = 'info') {
         const timestamp = new Date().toLocaleTimeString();
         eventLogs = [...eventLogs.slice(-10), { timestamp, message, type }];
         console.log(`[${type.toUpperCase()}] ${message}`);
     }
-
-    async function generateChallenge() {
-        const challenge = crypto.getRandomValues(new Uint8Array(32));
-        return Array.from(challenge);
-    }
-
+    
     async function generateKeyPair() {
         try {
-            // Generate ECDSA key pair for signing
-            const signingKeyPair = await crypto.subtle.generateKey(
-                {
-                    name: 'ECDSA',
-                    namedCurve: 'P-256'
-                },
-                true,
-                ['sign', 'verify']
-            );
-
-            // Generate RSA key pair for encryption
-            const encryptionKeyPair = await crypto.subtle.generateKey(
-                {
-                    name: 'RSA-OAEP',
-                    modulusLength: 2048,
-                    publicExponent: new Uint8Array([1, 0, 1]),
-                    hash: 'SHA-256'
-                },
-                true,
-                ['encrypt', 'decrypt']
-            );
-
-            // Export the public keys in the correct format
-            const signingPublicKey = await crypto.subtle.exportKey(
-                'raw',  // Changed from 'spki' to 'raw' for ECDSA
-                signingKeyPair.publicKey
-            );
-
-            const encryptionPublicKey = await crypto.subtle.exportKey(
-                'spki',
-                encryptionKeyPair.publicKey
-            );
-
+            const privateKey = ed.utils.randomPrivateKey();
+            const publicKey = await ed.getPublicKey(privateKey);
+            
             keyPair = {
-                signing: signingKeyPair,
-                encryption: encryptionKeyPair
+                privateKey,
+                publicKey
             };
-
-            log('Key pairs generated successfully', 'success');
-            log(`Signing public key length: ${signingPublicKey.byteLength}`, 'info');
-            log(`Encryption public key length: ${encryptionPublicKey.byteLength}`, 'info');
-
-            return {
-                signingPublicKey: Array.from(new Uint8Array(signingPublicKey)),
-                encryptionPublicKey: Array.from(new Uint8Array(encryptionPublicKey)),
-                keyPair: keyPair
-            };
+    
+            const testMessage = new TextEncoder().encode('test');
+            const testSignature = await ed.sign(testMessage, privateKey);
+            const isValid = await ed.verify(testSignature, testMessage, publicKey);
+            
+            if (!isValid) {
+                throw new Error('Key pair verification failed');
+            }
+            
+            log('Ed25519 key pair generated and verified successfully', 'success');
+            return keyPair;
         } catch (error) {
             log(`Key pair generation error: ${error.message}`, 'error');
-            console.error('Full key pair generation error:', error);
             return null;
         }
     }
-
+    
     async function signPayload(payload) {
         try {
-            if (!keyPair || !keyPair.signing) {
-                throw new Error('Signing key pair not initialized');
-            }
-
-            const encoder = new TextEncoder();
-            const verificationPayload = {
-                challenge: payload.challenge,
-                offer: payload.offer,
-                encrypted_data: payload.encrypted_data,
-                connection_message: payload.connection_message
-            };
-
-            const data = encoder.encode(JSON.stringify(verificationPayload));
-            
-            const signature = await crypto.subtle.sign(
-                {
-                    name: 'ECDSA',
-                    hash: { name: 'SHA-256' }
-                },
-                keyPair.signing.privateKey,
-                data
-            );
-
-            // Return the signature as a byte array
-            return Array.from(new Uint8Array(signature));
+            const message = new TextEncoder().encode(JSON.stringify(payload));
+            const signature = await ed.sign(message, keyPair.privateKey);
+            return Array.from(signature);
         } catch (error) {
-            log(`Payload signing error: ${error.message}`, 'error');
-            console.error('Full signing error:', error);
+            log(`Signing error: ${error.message}`, 'error');
             return null;
         }
     }
-
-    async function verifyPayloadSignature(payload, signature, publicKey) {
-        try {
-            log('Starting payload signature verification', 'info');
-            
-            // Log input details
-            log(`Payload details: ${JSON.stringify({
-                challenge: payload.challenge ? Array.from(payload.challenge) : null,
-                offer: payload.offer ? 'Present' : 'Not Present',
-                encrypted_data: payload.encrypted_data ? 'Present' : 'Not Present',
-                connection_message: payload.connection_message
-            })}`, 'info');
-            
-            log(`Public key length: ${publicKey.length}`, 'info');
-            log(`Signature length: ${signature.length}`, 'info');
-
-            const importedPublicKey = await crypto.subtle.importKey(
-                'spki',
-                new Uint8Array(publicKey),
-                {
-                    name: 'ECDSA',
-                    namedCurve: 'P-256'
-                },
-                true,
-                ['verify']
-            );
-
-            const verificationPayload = {
-                challenge: payload.challenge,
-                offer: payload.offer,
-                encrypted_data: payload.encrypted_data,
-                connection_message: payload.connection_message
-            };
-
-            const encoder = new TextEncoder();
-            const data = encoder.encode(JSON.stringify(verificationPayload));
-
-            log(`Verification payload JSON: ${JSON.stringify(verificationPayload)}`, 'info');
-            log(`Verification data bytes length: ${data.length}`, 'info');
-
-            const verificationResult = await crypto.subtle.verify(
-                {
-                    name: 'ECDSA',
-                    hash: 'SHA-256'
-                },
-                importedPublicKey,
-                new Uint8Array(signature),
-                data
-            );
-
-            log(`Signature verification result: ${verificationResult}`, 'info');
-            return verificationResult;
-        } catch (error) {
-            log(`Signature verification error: ${error.message}`, 'error');
-            console.error('Full verification error:', error);
-            return false;
-        }
-    }
-
+    
     async function initializeWebRTC() {
         try {
+            const generatedKeyPair = await generateKeyPair();
+            if (!generatedKeyPair) {
+                throw new Error('Failed to generate key pair');
+            }
+            keyPair = generatedKeyPair;
+    
             localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+            if (!localVideoElement) {
+                throw new Error('Local video element not bound');
+            }
             localVideoElement.srcObject = localStream;
             log('Local media stream acquired', 'success');
-
+    
             peerConnection = new RTCPeerConnection(peerConfig);
             localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
             
             peerConnection.onicecandidate = handleICECandidate;
             peerConnection.ontrack = handleRemoteTrack;
             peerConnection.onconnectionstatechange = handleConnectionStateChange;
-
-            connectSignalingServer();
+    
+            clientId = crypto.randomUUID();
+            await connectSignalingServer();
+            isInitialized = true;
+            canCreateOffer = true;
+            log('WebRTC system fully initialized', 'success');
+            
+            return true;
         } catch (error) {
             log(`WebRTC initialization error: ${error.message}`, 'error');
+            isInitialized = false;
+            canCreateOffer = false;
+            return false;
         }
     }
-
+    
+    function connectSignalingServer() {
+        return new Promise((resolve, reject) => {
+            try {
+                signalingSocket = new WebSocket(SIGNALING_SERVER);
+    
+                signalingSocket.onopen = () => {
+                    connectionStatus = 'Connected';
+                    log('Signaling server connection established', 'success');
+                    resolve(true);
+                };
+    
+                signalingSocket.onerror = (error) => {
+                    log(`Signaling server error: ${error.message}`, 'error');
+                    reject(error);
+                };
+    
+                signalingSocket.onmessage = async (event) => {
+                    const message = JSON.parse(event.data);
+                    await handleSignalingMessage(message);
+                };
+    
+                signalingSocket.onclose = () => {
+                    connectionStatus = 'Disconnected';
+                    isVerified = false;
+                    isInitialized = false;
+                    canCreateOffer = false;
+                    log('Signaling server connection closed', 'warning');
+                };
+    
+                setTimeout(() => {
+                    if (signalingSocket.readyState !== WebSocket.OPEN) {
+                        reject(new Error('Connection timeout'));
+                    }
+                }, 5000);
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+    
+    function handleICECandidate(event) {
+        if (event.candidate) {
+            sendSignalingMessage(SignalTypes.ICE_CANDIDATE, event.candidate);
+        }
+    }
+    
+    function handleRemoteTrack(event) {
+        if (remoteVideoElement && event.streams[0]) {
+            remoteVideoElement.srcObject = event.streams[0];
+        }
+    }
+    
+    function handleConnectionStateChange() {
+        if (peerConnection) {
+            peerConnectionStatus = peerConnection.connectionState;
+            log(`Peer connection state: ${peerConnectionStatus}`);
+            
+            if (peerConnectionStatus === 'connected') {
+                isCalling = true;
+            } else if (peerConnectionStatus === 'disconnected' || 
+                       peerConnectionStatus === 'failed' || 
+                       peerConnectionStatus === 'closed') {
+                isCalling = false;
+            }
+        }
+    }
     
     async function createOffer() {
         try {
-            if (!keyPair) {
-                const keyGenResult = await generateKeyPair();
-                if (!keyGenResult) {
-                    throw new Error('Failed to generate key pair');
-                }
-                
-                // Log key pair generation details
-                log(`Key pair generated successfully`, 'success');
-                log(`Signing public key exported length: ${keyGenResult.signingPublicKey.length}`, 'info');
+            if (!isInitialized) {
+                throw new Error('WebRTC system not initialized. Please initialize first.');
             }
-
-            const challenge = await generateChallenge();
-            currentChallenge = challenge;
-            log(`Generated challenge: ${Array.from(challenge)}`, 'info');
-
+            if (!keyPair || !keyPair.privateKey || !keyPair.publicKey) {
+                throw new Error('Cryptographic keys not properly initialized');
+            }
+            if (signalingSocket?.readyState !== WebSocket.OPEN) {
+                throw new Error('Signaling server connection not established');
+            }
+    
+            isCalling = true;
             const offer = await peerConnection.createOffer();
             await peerConnection.setLocalDescription(offer);
-            log(`Created local offer`, 'success');
-
-            const publicKey = await crypto.subtle.exportKey(
-                'spki', 
-                keyPair.encryption.publicKey
-            );
-
-            const connectionMessage = offerMessage || 'Secure connection request';
-
-            const encryptedData = await encryptWithPublicKey(
-                connectionMessage, 
-                new Uint8Array(publicKey)
-            );
-
-            if (!encryptedData) {
-                throw new Error('Encryption failed: Unable to encrypt connection message');
-            }
-
-            const signature = await signPayload({
-                challenge: Array.from(challenge),
+            const secureConnectionPayload = {
                 offer: offer,
-                encrypted_data: encryptedData,
-                connection_message: connectionMessage
-            });
-
-            if (!signature) {
-                throw new Error('Failed to create payload signature');
-            }
-
-            log(`Signature created successfully`, 'success');
-
-            const connectionVerificationPayload = {
-                challenge: Array.from(challenge),
-                offer: offer,
-                encrypted_data: encryptedData,
-                connection_message: connectionMessage,
-                public_key: Array.from(new Uint8Array(publicKey)),
-                signature: signature
+                public_key: Array.from(keyPair.publicKey),
+                nonce: Array.from(crypto.getRandomValues(new Uint8Array(32)))
             };
-
-            // Log the full payload before sending
-            log(`Connection verification payload details:
-                Challenge length: ${connectionVerificationPayload.challenge.length}
-                Public key length: ${connectionVerificationPayload.public_key.length}
-                Signature length: ${connectionVerificationPayload.signature.length}
-                Offer present: ${!!connectionVerificationPayload.offer}
-                Encrypted data present: ${!!connectionVerificationPayload.encrypted_data}
-            `, 'info');
-
-            sendSignalingMessage('offer-with-challenge', connectionVerificationPayload);
-            log('Offer sent with challenge and signature', 'success');
+            const signature = await signPayload(secureConnectionPayload.offer);
+            if (!signature) {
+                throw new Error('Failed to sign offer payload');
+            }
+            secureConnectionPayload.signature = signature;
+            sendSignalingMessage(SignalTypes.SECURE_OFFER, secureConnectionPayload);
+            
+            log('Secure offer created and sent successfully', 'success');
+            return true;
         } catch (error) {
             log(`Offer creation error: ${error.message}`, 'error');
-            console.error('Full offer creation error:', error);
+            isCalling = false;
+            return false;
         }
     }
-
-    async function handleOfferWithChallenge(payload) {
+    
+    async function handleSecureOffer(payload) {
         try {
-            const { 
-                challenge, 
-                offer, 
-                connection_message, 
-                public_key, 
-                signature 
-            } = payload;
+            if (!peerConnection) {
+                throw new Error('No peer connection established');
+            }
+    
+            const { offer, signature, public_key } = payload;
+            const message = new TextEncoder().encode(JSON.stringify(offer));
+            const isValid = await ed.verify(signature, message, public_key);
             
-            const signatureVerified = await verifyPayloadSignature(
-                { challenge, offer, connection_message }, 
-                signature, 
-                public_key
-            );
-
-            if (!signatureVerified) {
-                log('Payload signature verification failed', 'error');
-                return;
+            if (!isValid) {
+                throw new Error('Invalid offer signature');
             }
-
-            const decryptedMessage = await decryptWithPublicKey(
-                connection_message, 
-                public_key
-            );
-
-            if (decryptedMessage) {
-                log('Connection message verified successfully', 'success');
-                isOfferReceived = true;
-                
-                await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-                const answer = await peerConnection.createAnswer();
-                await peerConnection.setLocalDescription(answer);
-
-                const responsePayload = {
-                    challenge: challenge,
-                    challenge_response: await encryptWithPublicKey(
-                        JSON.stringify(challenge), 
-                        public_key
-                    )
-                };
-
-                sendSignalingMessage('challenge-response', responsePayload);
-            }
-        } catch (error) {
-            log(`Offer with challenge error: ${error.message}`, 'error');
-        }
-    }
-
-    async function encryptWithPublicKey(message, publicKeyData) {
-        try {
-            // Ensure publicKeyData is a valid array or Uint8Array
-            const keyData = publicKeyData instanceof Uint8Array 
-                ? publicKeyData 
-                : new Uint8Array(publicKeyData);
-
-            // Validate key data
-            if (!keyData || keyData.length === 0) {
-                throw new Error('Invalid public key data');
-            }
-
-            // Generate a random IV (even though RSA-OAEP doesn't use it, we need it for the payload structure)
-            const iv = crypto.getRandomValues(new Uint8Array(16));
-
-            const publicKey = await crypto.subtle.importKey(
-                'spki',
-                keyData,
-                {
-                    name: 'RSA-OAEP',
-                    hash: 'SHA-256'
-                },
-                false,
-                ['encrypt']
-            );
-
-            const encoder = new TextEncoder();
-            const data = encoder.encode(message);
-
-            const encryptedData = await crypto.subtle.encrypt(
-                { name: 'RSA-OAEP' },
-                publicKey,
-                data
-            );
-
-            // Create signature for the encrypted data
-            const signature = crypto.getRandomValues(new Uint8Array(64)); // Placeholder signature
-            
-            return {
-                encrypted: Array.from(new Uint8Array(encryptedData)),
-                iv: Array.from(iv), // Include the IV in the payload
-                sender_ip: window.location.hostname, // Add sender IP
-                signature: Array.from(signature) // Include the signature
+    
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+    
+            const secureAnswerPayload = {
+                offer: answer,
+                public_key: Array.from(keyPair.publicKey),
+                nonce: Array.from(crypto.getRandomValues(new Uint8Array(32)))
             };
+    
+            const answerSignature = await signPayload(secureAnswerPayload.offer);
+            secureAnswerPayload.signature = answerSignature;
+    
+            sendSignalingMessage(SignalTypes.SECURE_ANSWER, secureAnswerPayload);
+            isVerified = true;
+            isCalling = true;
+            log('Secure offer handled and answer sent', 'success');
         } catch (error) {
-            log(`Public key encryption error: ${error.message}`, 'error');
-            console.error('Full encryption error:', error);
-            return null;
+            log(`Secure offer handling error: ${error.message}`, 'error');
+            isCalling = false;
         }
     }
 
-    async function decryptWithPublicKey(encryptedMessage, publicKeyData) {
+    async function handleSecureAnswer(payload) {
         try {
-            const publicKey = await crypto.subtle.importKey(
-                'spki',
-                new Uint8Array(publicKeyData),
-                {
-                    name: 'RSA-OAEP',
-                    hash: 'SHA-256'
-                },
-                false,
-                ['decrypt']
-            );
-
-            const decryptedData = await crypto.subtle.decrypt(
-                {
-                    name: 'RSA-OAEP'
-                },
-                publicKey,
-                new Uint8Array(encryptedMessage)
-            );
-
-            return new TextDecoder().decode(decryptedData);
+            if (!peerConnection) {
+                throw new Error('No peer connection established');
+            }
+    
+            const { offer, signature, public_key } = payload;
+            const message = new TextEncoder().encode(JSON.stringify(offer));
+            const isValid = await ed.verify(signature, message, public_key);
+            
+            if (!isValid) {
+                throw new Error('Invalid answer signature');
+            }
+    
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+            isVerified = true;
+            log('Secure answer processed successfully', 'success');
         } catch (error) {
-            log(`Public key decryption error: ${error.message}`, 'error');
-            return null;
+            log(`Secure answer handling error: ${error.message}`, 'error');
+            isCalling = false;
         }
     }
 
     async function handleSignalingMessage(message) {
         try {
-            const parsedPayload = JSON.parse(message.payload);
+            const payload = JSON.parse(message.payload);
+            
+            if (!message.sender_id || message.sender_id === clientId) {
+                return;
+            }
+    
             switch (message.signal_type) {
-                case 'offer-with-challenge': 
-                    await handleOfferWithChallenge(parsedPayload); 
+                case SignalTypes.SECURE_OFFER:
+                    await handleSecureOffer(payload);
                     break;
-                case 'challenge-response':
-                    await validateChallengeResponse(parsedPayload);
+                case SignalTypes.SECURE_ANSWER:
+                    await handleSecureAnswer(payload);
                     break;
-                case 'connection-verified':
-                    handleConnectionVerification();
-                    break;
-                case 'answer': 
-                    await handleAnswer(parsedPayload); 
-                    break;
-                case 'ice-candidate': 
-                    await peerConnection.addIceCandidate(new RTCIceCandidate(parsedPayload)); 
-                    break;
-                case 'chat':
-                    handleIncomingChat(parsedPayload);
-                    break;
-                case 'offer-rejected':
-                    handleOfferRejected();
+                case SignalTypes.ICE_CANDIDATE:
+                    if (peerConnection && isVerified && payload) {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(payload));
+                    }
                     break;
             }
         } catch (error) {
             log(`Signaling message handling error: ${error.message}`, 'error');
         }
     }
-
-    function connectSignalingServer() {
-        try {
-            signalingSocket = new WebSocket(SIGNALING_SERVER);
-
-            signalingSocket.onopen = () => {
-                connectionStatus = 'Connected';
-                log('Signaling server connection established', 'success');
-            };
-
-            signalingSocket.onmessage = async (event) => {
-                try {
-                    const message = JSON.parse(event.data);
-                    await handleSignalingMessage(message);
-                } catch (error) {
-                    log(`Signaling message error: ${error.message}`, 'error');
-                }
-            };
-
-            signalingSocket.onclose = () => {
-                connectionStatus = 'Disconnected';
-                log('Signaling server connection closed', 'warning');
-            };
-
-            signalingSocket.onerror = (error) => {
-                log(`Signaling server connection error: ${error}`, 'error');
-            };
-        } catch (error) {
-            log(`WebSocket connection error: ${error.message}`, 'error');
-        }
-    }
-
+    
     function sendSignalingMessage(signalType, payload) {
-        if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
-            const message = JSON.stringify({
+        if (signalingSocket?.readyState === WebSocket.OPEN) {
+            const message = {
                 signal_type: signalType,
                 payload: JSON.stringify(payload),
-                timestamp: Date.now()
-            });
-            signalingSocket.send(message);
+                sender_id: clientId,
+                timestamp: Date.now(),
+                signature: null
+            };
+            
+            signalingSocket.send(JSON.stringify(message));
         } else {
-            log('Signaling socket not open', 'error');
-        }
-    }
-
-    async function validateChallengeResponse(challengePayload) {
-        try {
-            if (currentChallenge && 
-                JSON.stringify(challengePayload) === JSON.stringify(currentChallenge)) {
-                log('Challenge validated successfully', 'success');
-                
-                sendSignalingMessage('connection-verified', {});
-            } else {
-                log('Challenge validation failed', 'error');
-            }
-        } catch (error) {
-            log(`Challenge validation error: ${error.message}`, 'error');
-        }
-    }
-
-    function handleConnectionVerification() {
-        peerConnectionStatus = 'Verified';
-        log('Peer connection fully verified', 'success');
-    }
-
-    async function handleAnswer(answer) {
-        try {
-            await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-            log('Remote answer set successfully', 'success');
-        } catch (error) {
-            log(`Answer handling error: ${error.message}`, 'error');
-        }
-    }
-
-    function handleICECandidate(event) {
-        if (event.candidate) {
-            sendSignalingMessage('ice-candidate', event.candidate);
-            log('ICE candidate generated', 'info');
-        }
-    }
-
-    function handleRemoteTrack(event) {
-        if (event.streams && event.streams[0]) {
-            remoteVideoElement.srcObject = event.streams[0];
-            log('Remote track received', 'success');
-        }
-    }
-
-    function handleConnectionStateChange() {
-        if (peerConnection) {
-            peerConnectionStatus = peerConnection.connectionState;
-            log(`Connection state changed: ${peerConnectionStatus}`, 'info');
+            log('Signaling socket not ready', 'error');
         }
     }
     
-    function sendChatMessage() {
-        if (chatMessage.trim()) {
-            const message = {
-                text: chatMessage,
-                sender: 'Me',
-                timestamp: new Date().toLocaleTimeString()
-            };
-
-            sendSignalingMessage('chat', message);
-            chatMessages = [...chatMessages, message];
-            chatMessage = '';
-        }
-    }
-
-    function handleIncomingChat(message) {
-        chatMessages = [...chatMessages, {
-            ...message,
-            sender: 'remote'
-        }];
-    }
-
-    async function startScreenShare() {
-        if (isScreenSharing) {
-            endScreenShare();
+    function toggleTrack(kind) {
+        if (!localStream || !isInitialized) {
+            log(`Cannot toggle ${kind}: stream unavailable or not initialized`, 'error');
             return;
         }
-
-        try {
-            const screenStream = await navigator.mediaDevices.getDisplayMedia({ 
-                video: true,
-                audio: false 
-            });
-
-            screenStream.getVideoTracks()[0].onended = endScreenShare;
-
-            const videoTrack = screenStream.getVideoTracks()[0];
-            const sender = peerConnection.getSenders().find(s => s.track.kind === 'video');
-            
-            if (sender) {
-                await sender.replaceTrack(videoTrack);
-                isScreenSharing = true;
-                log('Screen sharing started', 'success');
-            }
-        } catch (error) {
-            log(`Screen share error: ${error.message}`, 'error');
-        }
-    }
-
-    function endScreenShare() {
-        if (!isScreenSharing) return;
-
-        const videoTrack = localStream.getVideoTracks()[0];
-        const sender = peerConnection.getSenders().find(s => s.track.kind === 'video');
-        
-        if (sender) {
-            sender.replaceTrack(videoTrack);
-            isScreenSharing = false;
-            log('Screen sharing ended', 'info');
-        }
-    }
-
-    function toggleTrack(kind) {
-        if (!localStream) return;
         
         const tracks = localStream.getTracks().filter(track => track.kind === kind);
         tracks.forEach(track => {
             track.enabled = !track.enabled;
-            if (kind === 'video') {
-                deviceState.isVideoMuted = !track.enabled;
-            } else if (kind === 'audio') {
-                deviceState.isAudioMuted = !track.enabled;
-            }
+            deviceState[kind === 'video' ? 'isVideoMuted' : 'isAudioMuted'] = !track.enabled;
+            log(`${kind} ${track.enabled ? 'unmuted' : 'muted'}`, 'info');
         });
-        
-        log(`${kind.charAt(0).toUpperCase() + kind.slice(1)} ${tracks[0].enabled ? 'Unmuted' : 'Muted'}`, 'info');
     }
-
-    function handleOfferRejected() {
-        log('Offer was rejected by peer', 'warning');
+    
+    async function startScreenShare() {
+        if (!peerConnection || !isInitialized) {
+            log('Cannot start screen share: connection not initialized', 'error');
+            return;
+        }
+    
+        try {
+            if (isScreenSharing) {
+                await endScreenShare();
+                return;
+            }
+    
+            const screenStream = await navigator.mediaDevices.getDisplayMedia({ 
+                video: true 
+            });
+    
+            screenStream.getVideoTracks()[0].onended = endScreenShare;
+    
+            const sender = peerConnection.getSenders().find(s => s.track?.kind === 'video');
+            if (sender) {
+                await sender.replaceTrack(screenStream.getVideoTracks()[0]);
+                isScreenSharing = true;
+                log('Screen sharing started', 'success');
+            }
+        } catch (error) {
+            log(`Screen sharing error: ${error.message}`, 'error');
+        }
     }
-
-    function rejectOffer() {
-        isOfferReceived = false;
-        sendSignalingMessage('offer-rejected', {});
-        log('Offer rejected', 'warning');
+    
+    async function endScreenShare() {
+        try {
+            const videoTrack = localStream?.getVideoTracks()[0];
+            const sender = peerConnection?.getSenders().find(s => s.track?.kind === 'video');
+            
+            if (sender && videoTrack) {
+                await sender.replaceTrack(videoTrack);
+                isScreenSharing = false;
+                log('Screen sharing ended', 'info');
+            }
+        } catch (error) {
+            log(`Error ending screen share: ${error.message}`, 'error');
+        }
+    }
+    
+    function endCall() {
+        if (peerConnection) {
+            peerConnection.close();
+            isCalling = false;
+            isVerified = false;
+            log('Call ended', 'info');
+        }
     }
 
     onMount(async () => {
@@ -643,109 +405,94 @@
     });
 
     onDestroy(() => {
-        if (peerConnection) {
-            peerConnection.close();
-        }
-        if (signalingSocket) {
-            signalingSocket.close();
-        }
-        if (localStream) {
-            localStream.getTracks().forEach(track => track.stop());
-        }
+        peerConnection?.close();
+        signalingSocket?.close();
+        localStream?.getTracks().forEach(track => track.stop());
     });
+
 </script>
 
+<!-- Main container with dark theme -->
 <main class="webrtc-container dark-theme">
     <div class="video-section">
         <div class="video-grid">
-            <!-- Local Stream -->
+            <!-- Local Stream Video Container -->
             <div class="video-wrapper local-stream">
                 <div class="video-header">
                     <h3>Local Stream</h3>
                     <div class="stream-indicators">
                         <span class:active={!deviceState.isVideoMuted} 
                               class:inactive={deviceState.isVideoMuted}>
-                            {!deviceState.isVideoMuted ? '📹 Video' : '🚫 Video'}
+                            {deviceState.isVideoMuted ? '🚫 Video' : '📹 Video'}
                         </span>
                         <span class:active={!deviceState.isAudioMuted} 
                               class:inactive={deviceState.isAudioMuted}>
-                            {!deviceState.isAudioMuted ? '🎤 Audio' : '🔇 Audio'}
+                            {deviceState.isAudioMuted ? '🔇 Audio' : '🎤 Audio'}
                         </span>
                     </div>
                 </div>
-                <video bind:this={localVideoElement} autoplay muted playsinline></video>
+                <!-- Local video element with bindings -->
+                <video bind:this={localVideoElement} 
+                       autoplay 
+                       muted 
+                       playsinline>
+                </video>
             </div>
 
-            <!-- Remote Stream -->
+            <!-- Remote Stream Video Container -->
             <div class="video-wrapper remote-stream">
                 <div class="video-header">
                     <h3>Remote Stream</h3>
-                    <div class="connection-status">
+                    <div class="connection-status" 
+                         class:connected={peerConnectionStatus === 'Connected'} 
+                         class:disconnected={peerConnectionStatus === 'Disconnected'}>
                         {peerConnectionStatus}
                     </div>
                 </div>
-                <video bind:this={remoteVideoElement} autoplay playsinline></video>
+                <!-- Remote video element with bindings -->
+                <!-- svelte-ignore a11y-media-has-caption -->
+                <video bind:this={remoteVideoElement} 
+                       autoplay 
+                       playsinline>
+                </video>
             </div>
         </div>
     </div>
 
-    <!-- Connection Controls -->
+    <!-- Control Section -->
     <div class="controls-section">
+        <!-- Connection Controls -->
         <div class="control-group">
-            <button on:click={() => createOffer()} class="primary-btn">
+            <button on:click={createOffer} 
+                    class="primary-btn" 
+                    disabled={!peerConnection || connectionStatus !== 'Connected'}>
                 <span>🤝 Create Offer</span>
             </button>
-            <button 
-                on:click={() => startScreenShare()} 
-                class="secondary-btn {isScreenSharing ? 'active' : ''}"
-            >
-                <span>{isScreenSharing ? '⏹️ End Screen Share' : '📺 Share Screen'}</span>
+            <button on:click={startScreenShare} 
+                    class="secondary-btn {isScreenSharing ? 'active' : ''}"
+                    disabled={!peerConnection}>
+                <span>{isScreenSharing ? '⏹️ Stop Screen Share' : '📺 Share Screen'}</span>
             </button>
         </div>
 
-        <!-- Device Controls -->
+        <!-- Media Controls -->
         <div class="control-group toggle-controls">
-            <button 
-                on:click={() => toggleTrack('video')} 
-                class="toggle-btn {deviceState.isVideoMuted ? 'muted' : ''}"
-            >
-                <span>{deviceState.isVideoMuted ? '📹 Unmute Video' : '🚫 Mute Video'}</span>
+            <button on:click={() => toggleTrack('video')} 
+                    class="toggle-btn {deviceState.isVideoMuted ? 'muted' : ''}">
+                <span>{deviceState.isVideoMuted ? '📹 Enable Video' : '🚫 Disable Video'}</span>
             </button>
-            <button 
-                on:click={() => toggleTrack('audio')} 
-                class="toggle-btn {deviceState.isAudioMuted ? 'muted' : ''}"
-            >
-                <span>{deviceState.isAudioMuted ? '🎤 Unmute Audio' : '🔇 Mute Audio'}</span>
+            <button on:click={() => toggleTrack('audio')} 
+                    class="toggle-btn {deviceState.isAudioMuted ? 'muted' : ''}">
+                <span>{deviceState.isAudioMuted ? '🎤 Enable Audio' : '🔇 Disable Audio'}</span>
             </button>
-        </div>
-
-        <!-- Chat Section -->
-        <div class="chat-section">
-            <div class="chat-messages">
-                {#each chatMessages as msg}
-                    <div class="chat-message {msg.sender}">
-                        <span class="timestamp">{msg.timestamp}</span>
-                        <span class="text">{msg.text}</span>
-                    </div>
-                {/each}
-            </div>
-            <div class="chat-input">
-                <input 
-                    type="text" 
-                    bind:value={chatMessage} 
-                    placeholder="Type a message..."
-                    on:keydown={(e) => e.key === 'Enter' && sendChatMessage()}
-                >
-                <button on:click={sendChatMessage}>Send</button>
-            </div>
         </div>
     </div>
 
-    <!-- Event Log -->
+    <!-- Event Logging Section -->
     <div class="event-log">
         <h3>Event Log</h3>
         <ul>
-            {#each eventLogs as log}
+            {#each eventLogs as log (log.timestamp)}
                 <li class="log-entry {log.type}">
                     <span class="timestamp">{log.timestamp}</span>
                     <span class="message">{log.message}</span>
@@ -754,17 +501,14 @@
         </ul>
     </div>
 
-    <!-- Offer Modal -->
-    {#if isOfferReceived}
-        <div class="offer-modal">
-            <div class="offer-content">
-                <h3>Incoming Connection Request</h3>
-                <p>A peer wants to establish a connection.</p>
-                <div class="offer-actions">
-                    <button on:click={() => createOffer()} class="accept-btn">Accept</button>
-                    <button on:click={() => rejectOffer()} class="reject-btn">Reject</button>
-                </div>
-            </div>
+    <!-- Connection Status Toast -->
+    {#if connectionStatus === 'Connected'}
+        <div class="status-toast success" transition:slide>
+            Connected to signaling server
+        </div>
+    {:else if connectionStatus === 'Disconnected'}
+        <div class="status-toast error" transition:slide>
+            Disconnected from signaling server
         </div>
     {/if}
 </main>
