@@ -4,9 +4,9 @@
 
     async function createOffer() {
         try {
-            // Implement offer creation logic
+            // TODO: Implement offer creation logic
             webSocketStore.sendMessage('create-offer', {
-                // Include necessary offer details
+                // TODO: Include necessary offer details
             });
         } catch (error) {
             connectionStore.setError(error.message);
@@ -15,7 +15,7 @@
 
     function startScreenShare() {
         mediaStore.toggleScreenShare();
-        // Additional screen share logic
+        // TODO: Additional screen share logic
     }
 </script>
 
