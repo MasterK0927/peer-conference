@@ -40,6 +40,7 @@
             $mediaStore.localStream.getTracks().forEach(track => track.stop());
         }
     });
+
 </script>
 
 <main class="webrtc-container">
