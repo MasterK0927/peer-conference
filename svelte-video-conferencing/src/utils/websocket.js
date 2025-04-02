@@ -1,5 +1,5 @@
 import { writable } from 'svelte/store';
-import { connectionStore } from '../stores';
+import { connectionStore, chatStore } from '../stores';
 
 export function createWebSocketConnection(url) {
     let socket = null;
