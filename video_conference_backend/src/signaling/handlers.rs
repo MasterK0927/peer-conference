@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::collections::HashMap;
-use ed25519_dalek::{Verifier, VerifyingKey};
 use tokio_tungstenite::tungstenite::protocol::Message;
+use p256::ecdsa::signature::Verifier;
 
 pub async fn handle_secure_offer(
     signal: &SignalMessage,
@@ -79,14 +79,71 @@ fn verify_signature(
     signature: &[u8],
     public_key: &[u8],
 ) -> bool {
-    if let Ok(public_key_array) = <&[u8; 32]>::try_from(public_key) {
-        if let Ok(verify_key) = VerifyingKey::from_bytes(public_key_array) {
-            if let Ok(message) = serde_json::to_vec(data) {
-                if let Ok(sig) = <&[u8; 64]>::try_from(signature).and_then(|s| Ok(ed25519_dalek::Signature::try_from(s))) {
-                    return verify_key.verify(&message, &sig.unwrap()).is_ok();
-                }
-            }
+    // Check public key length - P-256 public keys are uncompressed (65 bytes) or compressed (33 bytes)
+    if public_key.len() != 65 && public_key.len() != 33 {
+        eprintln!("[ERROR] Invalid public key length: expected 65 or 33 bytes, got {}", public_key.len());
+        return false;
+    }
+
+    // Check signature length - P-256 ECDSA signatures are typically 64 bytes (r and s components)
+    if signature.len() != 64 {
+        eprintln!("[ERROR] Secure offer handling error: Uint8Array of valid length expected - got {} bytes", signature.len());
+        return false;
+    }
+
+    // Convert the message to bytes
+    let message = match serde_json::to_vec(data) {
+        Ok(msg) => msg,
+        Err(e) => {
+            eprintln!("[ERROR] Failed to serialize data: {}", e);
+            return false;
+        }
+    };
+
+    // Use p256 crate for verification
+    use p256::ecdsa::{Signature, VerifyingKey};
+    use p256::{EncodedPoint, FieldBytes};
+    
+    // Import public key
+    let encoded_point = match EncodedPoint::from_bytes(public_key) {
+        Ok(point) => point,
+        Err(e) => {
+            eprintln!("[ERROR] Failed to parse public key: {}", e);
+            return false;
+        }
+    };
+
+    let verifying_key = match VerifyingKey::from_encoded_point(&encoded_point) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("[ERROR] Invalid verifying key: {}", e);
+            return false;
+        }
+    };
+
+    // Create signature object from raw bytes - use clone_from_slice to get owned values
+    let signature = match Signature::from_scalars(
+        FieldBytes::clone_from_slice(&signature[..32]),
+        FieldBytes::clone_from_slice(&signature[32..])
+    ) {
+        Ok(sig) => sig,
+        Err(e) => {
+            eprintln!("[ERROR] Failed to parse signature: {}", e);
+            return false;
+        }
+    };
+
+    // Verify the signature
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(&message);
+    let digest = hasher.finalize();
+    
+    match verifying_key.verify(&digest, &signature) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("[ERROR] Signature verification failed: {}", e);
+            false
         }
     }
-    false
 }
